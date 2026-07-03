@@ -1,0 +1,34 @@
+import struct
+
+SYNC = b'\xaa\x55'
+HEADER = b'\x5a\xa5\x5a\xa5'
+
+def parse_fft_stream(ser):
+    while True:
+        # Find sync bytes
+        while ser.read(1) != SYNC[0:1]: pass
+        if ser.read(1) != SYNC[1:2]: continue
+
+        # Read header
+        hdr = ser.read(4)
+        if hdr != HEADER: continue
+
+        # Read full packet minus sync/header
+        payload = ser.read(1024 + 4 + 1)  # mags + frame_id + checksum
+        if len(payload) < 1029: continue
+
+        frame_id = struct.unpack('<I', payload[0:4])[0]
+        mags = struct.unpack('<512H', payload[4:1028])
+        checksum = payload[1028]
+
+        # Verify checksum
+        calc_checksum = 0
+        for b in SYNC + HEADER + payload[:-1]:
+            calc_checksum ^= b
+        if calc_checksum != checksum:
+            print(f"Frame {frame_id}: CHECKSUM FAIL")
+            continue
+
+        # Convert Q15 back to float if needed
+        float_mags = [m / 32767.0 for m in mags]
+        yield frame_id, float_mags

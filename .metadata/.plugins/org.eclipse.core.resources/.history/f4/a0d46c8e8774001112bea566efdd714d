@@ -1,0 +1,773 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "string.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* Total samples in the circular ADC/DMA buffer (2 halves of 512 samples).
+   At ~42.67 kSPS this represents ~24 ms of audio and produces a
+   half-complete / complete callback roughly every ~12 ms. */
+#define ADC_BUFFER_SIZE        1024
+#define ADC_HALF_BUFFER_SIZE   (ADC_BUFFER_SIZE / 2)   /* 512 samples = 1024 bytes per half */
+
+/* Depth of the software transmission queue (ring buffer of half-buffers).
+   Each slot holds one ADC half-buffer (512 samples / 1024 bytes).
+   Depth of 8 gives ~8 * 12 ms = ~96 ms of buffering headroom to absorb
+   UART/DMA latency jitter without losing samples, at a RAM cost of
+   8 * 1024 bytes = 8 KB - negligible on the F767's 512 KB SRAM.
+   Must be a power of two so index wraparound can use a simple mask. */
+#define TX_QUEUE_DEPTH          8
+#define TX_QUEUE_INDEX_MASK    (TX_QUEUE_DEPTH - 1)
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+#if defined ( __ICCARM__ ) /*!< IAR Compiler */
+#pragma location=0x2007c000
+ETH_DMADescTypeDef  DMARxDscrTab[ETH_RX_DESC_CNT]; /* Ethernet Rx DMA Descriptors */
+#pragma location=0x2007c0a0
+ETH_DMADescTypeDef  DMATxDscrTab[ETH_TX_DESC_CNT]; /* Ethernet Tx DMA Descriptors */
+
+#elif defined ( __CC_ARM )  /* MDK ARM Compiler */
+
+__attribute__((at(0x2007c000))) ETH_DMADescTypeDef  DMARxDscrTab[ETH_RX_DESC_CNT]; /* Ethernet Rx DMA Descriptors */
+__attribute__((at(0x2007c0a0))) ETH_DMADescTypeDef  DMATxDscrTab[ETH_TX_DESC_CNT]; /* Ethernet Tx DMA Descriptors */
+
+#elif defined ( __GNUC__ ) /* GNU Compiler */
+
+ETH_DMADescTypeDef DMARxDscrTab[ETH_RX_DESC_CNT] __attribute__((section(".RxDecripSection"))); /* Ethernet Rx DMA Descriptors */
+ETH_DMADescTypeDef DMATxDscrTab[ETH_TX_DESC_CNT] __attribute__((section(".TxDecripSection")));   /* Ethernet Tx DMA Descriptors */
+#endif
+
+ETH_TxPacketConfig TxConfig;
+
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
+ETH_HandleTypeDef heth;
+
+TIM_HandleTypeDef htim2;
+
+UART_HandleTypeDef huart3;
+
+PCD_HandleTypeDef hpcd_USB_OTG_FS;
+
+/* USER CODE BEGIN PV */
+
+/* Circular ADC sample buffer, continuously filled by ADC1 via DMA2_Stream0
+   in circular mode. Hardware-triggered by TIM2 TRGO; never stopped. */
+uint16_t adc_buffer[ADC_BUFFER_SIZE];
+
+/* ---- Software transmission ring buffer (queue of half-buffers) ----
+   Decouples ADC acquisition cadence from UART transmission cadence so
+   that a momentarily busy/slow UART link never blocks or stalls the
+   ADC DMA pipeline, and no samples are silently dropped under normal
+   (non-overflow) operating conditions. */
+static uint16_t tx_queue[TX_QUEUE_DEPTH][ADC_HALF_BUFFER_SIZE];
+
+/* Queue indices. Each is touched by exactly one producer/consumer context,
+   so plain volatile access is safe on this single-core Cortex-M part
+   without additional locking:
+     - queue_tail / queue_count (increment) : written only by ADC ISR callbacks
+     - queue_head / queue_count (decrement) : written only by UART TxCplt ISR
+     - both                                  : read only by the main loop
+*/
+static volatile uint16_t queue_head  = 0;  /* next slot to transmit            */
+static volatile uint16_t queue_tail  = 0;  /* next free slot to fill           */
+static volatile uint16_t queue_count = 0;  /* number of slots currently queued */
+
+/* Diagnostic counter: increments if the queue is ever completely full when
+   a new half-buffer becomes ready (i.e. average UART throughput is too low
+   for the configured baud rate / sample rate). In normal operation with the
+   baud rate set below this should remain 0. Exposed so it can be inspected
+   in a debugger or optionally reported over a side channel. */
+static volatile uint32_t queue_overflow_count = 0;
+
+/* True while a USART3 DMA transmission is in flight. Cleared by
+   HAL_UART_TxCpltCallback (success) or HAL_UART_ErrorCallback (failure),
+   so it can never get permanently stuck on a transmission error. */
+static volatile uint8_t uart_tx_busy = 0;
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_ETH_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_USB_OTG_FS_PCD_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM2_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/**
+  * @brief  Enqueue one ready ADC half-buffer into the software TX ring
+  *         buffer. Called from ADC ISR context (half/complete callbacks).
+  * @param  src Pointer to the first sample of the half-buffer to enqueue
+  *             (either &adc_buffer[0] or &adc_buffer[ADC_HALF_BUFFER_SIZE]).
+  * @note   Kept intentionally minimal for ISR safety (requirement #15):
+  *         a single bounded memcpy plus index bookkeeping, no UART calls,
+  *         no blocking, no loops over unbounded data.
+  *         If the queue is full, the new half-buffer is dropped and
+  *         queue_overflow_count is incremented for diagnostics rather
+  *         than corrupting an in-use slot or blocking the ISR.
+  */
+static void ADC_Queue_Enqueue(const uint16_t *src)
+{
+  if (queue_count >= TX_QUEUE_DEPTH)
+  {
+    /* Queue full: UART can't keep up on average. Drop this half-buffer
+       (oldest queued data is preserved/still in flight) and record it. */
+    queue_overflow_count++;
+    return;
+  }
+
+  /* Fast bounded copy: 512 * 2 = 1024 bytes, fixed size, no loops over
+     variable-length data -> safe and fast in interrupt context. */
+  memcpy(&tx_queue[queue_tail][0], src, ADC_HALF_BUFFER_SIZE * sizeof(uint16_t));
+
+  queue_tail = (queue_tail + 1) & TX_QUEUE_INDEX_MASK;
+  queue_count++;
+}
+
+/**
+  * @brief  ADC conversion half-complete callback.
+  *         DMA has just finished filling adc_buffer[0 .. 511]; DMA is now
+  *         writing into the second half, so the first half is safe to copy.
+  * @note   ISR context - body is just one bounded memcpy via the enqueue
+  *         helper above. No UART/HAL transmit calls are made here.
+  */
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
+{  HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0);   // or use LD1 if configured
+  if (hadc->Instance == ADC1)
+  {
+    ADC_Queue_Enqueue(&adc_buffer[0]);
+  }
+}
+
+/**
+  * @brief  ADC conversion complete callback.
+  *         DMA has just finished filling adc_buffer[512 .. 1023] and wraps
+  *         circularly back to index 0, so the second half is safe to copy.
+  * @note   ISR context - same minimal-work pattern as the half-complete
+  *         callback above.
+  */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+  if (hadc->Instance == ADC1)
+  {
+    ADC_Queue_Enqueue(&adc_buffer[ADC_HALF_BUFFER_SIZE]);
+  }
+}
+
+/**
+  * @brief  UART DMA transmit-complete callback.
+  *         Retires the slot that was just sent and clears the busy flag so
+  *         the main loop can launch the next queued transmission.
+  * @note   ISR context - O(1) index update only.
+  */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART3)
+  {
+    queue_head = (queue_head + 1) & TX_QUEUE_INDEX_MASK;
+    queue_count--;
+    uart_tx_busy = 0;
+  }
+}
+
+/**
+  * @brief  UART error callback.
+  *         Ensures a transmission error (e.g. framing/overrun on the line,
+  *         or a DMA transfer error) can never permanently latch
+  *         uart_tx_busy and silently stall all further transmission.
+  *         The current (failed) slot is retired the same way a completed
+  *         one would be, since its data is gone either way; the queue
+  *         simply moves on to the next slot.
+  * @note   ISR context - minimal recovery only.
+  */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART3)
+  {
+    if (uart_tx_busy)
+    {
+      queue_head = (queue_head + 1) & TX_QUEUE_INDEX_MASK;
+      if (queue_count > 0)
+      {
+        queue_count--;
+      }
+      uart_tx_busy = 0;
+    }
+    /* Clear error state and make sure the DMA stream is ready to accept
+       a new transfer request on the next Transmit_DMA call. */
+    __HAL_UART_CLEAR_PEFLAG(huart);
+  }
+}
+
+/**
+  * @brief  Services the TX queue from the main loop: if UART is idle and
+  *         at least one half-buffer is queued, launches a single
+  *         non-blocking UART DMA transmission for the oldest queued slot.
+  * @note   Called repeatedly from the main while(1) loop (requirement #16:
+  *         heavy/non-deterministic-latency work lives here, not in ISRs).
+  *         Sends exactly ADC_HALF_BUFFER_SIZE * 2 = 1024 raw bytes,
+  *         native little-endian uint16_t layout - no ASCII, no headers,
+  *         no delimiters, fully compatible with future FFT processing
+  *         on the PC side.
+  */
+static void UART_Queue_Service(void)
+{
+  if ((uart_tx_busy == 0) && (queue_count > 0))
+  {
+    uart_tx_busy = 1;
+    if (HAL_UART_Transmit_DMA(&huart3,
+                               (uint8_t *)&tx_queue[queue_head][0],
+                               ADC_HALF_BUFFER_SIZE * sizeof(uint16_t)) != HAL_OK)
+    {
+      /* Could not even start the DMA transfer (e.g. UART busy at HAL
+         level from some other path). Don't get stuck: release the busy
+         flag so this slot is retried on the next loop iteration instead
+         of stalling the whole queue. The slot is NOT retired here since
+         it was never actually sent. */
+      uart_tx_busy = 0;
+    }
+  }
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_ETH_Init();
+  MX_USART3_UART_Init();
+  MX_USB_OTG_FS_PCD_Init();
+  MX_ADC1_Init();
+  MX_TIM2_Init();
+  /* USER CODE BEGIN 2 */
+
+  /* Start ADC1 in DMA circular mode FIRST, arming the ADC/DMA chain so it
+     is ready to accept conversion results before any trigger can occur.
+     DMA2_Stream0 will continuously write samples into adc_buffer[] and
+     wrap automatically (Circular Mode, configured by CubeMX). */
+  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, ADC_BUFFER_SIZE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* Start TIM2 AFTER the ADC/DMA chain is armed, so no TRGO edge can be
+     missed. TIM2 TRGO (update event) triggers one regular ADC conversion
+     per pulse; timer prescaler/period are unchanged from the existing
+     CubeMX configuration, preserving the ~42.67 kSPS sampling rate exactly
+     as required. */
+  if (HAL_TIM_Base_Start(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE END 2 */
+//  const char msg[] = "Hello, UART!\r\n";
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+
+
+    /* All real work (UART queue draining) happens here in the main loop,
+       outside of interrupt context, per requirement #16. This call is
+       cheap and non-blocking: it either launches one new non-blocking
+       DMA transmission or does nothing if UART is already busy / queue
+       is empty, so the loop spins fast and never delays servicing of
+       the next ADC callback. */
+    UART_Queue_Service();
+
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+
+    /* Acquisition (ADC + DMA2_Stream0, hardware-triggered by TIM2) and
+       transmission (USART3 DMA, non-blocking, ring-buffered) both run
+       autonomously in the background. DMA is never stopped, so ADC
+       acquisition continues forever, satisfying requirements #8/#9.
+       queue_overflow_count can be inspected in a debugger to confirm
+       zero sample loss during bring-up/validation. */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure LSE Drive Capability
+  */
+  HAL_PWR_EnableBkUpAccess();
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 96;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Activate the Over-Drive mode
+  */
+  if (HAL_PWREx_EnableOverDrive() != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+  ADC_InjectionConfTypeDef sConfigInjected = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T2_TRGO;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_0;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configures for the selected ADC injected channel its corresponding rank in the sequencer and its sample time
+  */
+  sConfigInjected.InjectedChannel = ADC_CHANNEL_0;
+  sConfigInjected.InjectedRank = ADC_INJECTED_RANK_1;
+  sConfigInjected.InjectedNbrOfConversion = 1;
+  sConfigInjected.InjectedSamplingTime = ADC_SAMPLETIME_3CYCLES;
+  sConfigInjected.ExternalTrigInjecConvEdge = ADC_EXTERNALTRIGINJECCONVEDGE_NONE;
+  sConfigInjected.ExternalTrigInjecConv = ADC_INJECTED_SOFTWARE_START;
+  sConfigInjected.AutoInjectedConv = DISABLE;
+  sConfigInjected.InjectedDiscontinuousConvMode = DISABLE;
+  sConfigInjected.InjectedOffset = 0;
+  if (HAL_ADCEx_InjectedConfigChannel(&hadc1, &sConfigInjected) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief ETH Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ETH_Init(void)
+{
+
+  /* USER CODE BEGIN ETH_Init 0 */
+
+  /* USER CODE END ETH_Init 0 */
+
+   static uint8_t MACAddr[6];
+
+  /* USER CODE BEGIN ETH_Init 1 */
+
+  /* USER CODE END ETH_Init 1 */
+  heth.Instance = ETH;
+  MACAddr[0] = 0x00;
+  MACAddr[1] = 0x80;
+  MACAddr[2] = 0xE1;
+  MACAddr[3] = 0x00;
+  MACAddr[4] = 0x00;
+  MACAddr[5] = 0x00;
+  heth.Init.MACAddr = &MACAddr[0];
+  heth.Init.MediaInterface = HAL_ETH_RMII_MODE;
+  heth.Init.TxDesc = DMATxDscrTab;
+  heth.Init.RxDesc = DMARxDscrTab;
+  heth.Init.RxBuffLen = 1524;
+
+  /* USER CODE BEGIN MACADDRESS */
+
+  /* USER CODE END MACADDRESS */
+
+  if (HAL_ETH_Init(&heth) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  memset(&TxConfig, 0 , sizeof(ETH_TxPacketConfig));
+  TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CSUM | ETH_TX_PACKETS_FEATURES_CRCPAD;
+  TxConfig.ChecksumCtrl = ETH_CHECKSUM_IPHDR_PAYLOAD_INSERT_PHDR_CALC;
+  TxConfig.CRCPadCtrl = ETH_CRC_PAD_INSERT;
+  /* USER CODE BEGIN ETH_Init 2 */
+
+  /* USER CODE END ETH_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 2249;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  /* Baud rate raised from 115200 to 2,000,000 (2 Mbps).
+     REQUIRED CHANGE (not optional/cosmetic): at ~42.67 kSPS the raw
+     uint16_t stream is 85,334 bytes/s (~853 kbps on the wire with 8N1
+     framing). 115200 baud (~11.5 KB/s) cannot carry this and WILL lose
+     data no matter how good the buffering is - this is a hard physical
+     bandwidth limit, not a software bug. 2 Mbps gives ~200 KB/s, i.e.
+     roughly 2.3x headroom over the minimum required throughput. */
+  huart3.Init.BaudRate = 2000000;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  /* 8x oversampling (vs default 16x) allows accurate generation of this
+     high baud rate from the current APB clock and is the standard HAL
+     recommendation for baud rates above ~1 Mbps. */
+  huart3.Init.OverSampling = UART_OVERSAMPLING_8;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
+  * @brief USB_OTG_FS Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USB_OTG_FS_PCD_Init(void)
+{
+
+  /* USER CODE BEGIN USB_OTG_FS_Init 0 */
+
+  /* USER CODE END USB_OTG_FS_Init 0 */
+
+  /* USER CODE BEGIN USB_OTG_FS_Init 1 */
+
+  /* USER CODE END USB_OTG_FS_Init 1 */
+  hpcd_USB_OTG_FS.Instance = USB_OTG_FS;
+  hpcd_USB_OTG_FS.Init.dev_endpoints = 6;
+  hpcd_USB_OTG_FS.Init.speed = PCD_SPEED_FULL;
+  hpcd_USB_OTG_FS.Init.dma_enable = DISABLE;
+  hpcd_USB_OTG_FS.Init.phy_itface = PCD_PHY_EMBEDDED;
+  hpcd_USB_OTG_FS.Init.Sof_enable = ENABLE;
+  hpcd_USB_OTG_FS.Init.low_power_enable = DISABLE;
+  hpcd_USB_OTG_FS.Init.lpm_enable = DISABLE;
+  hpcd_USB_OTG_FS.Init.vbus_sensing_enable = ENABLE;
+  hpcd_USB_OTG_FS.Init.use_dedicated_ep1 = DISABLE;
+  if (HAL_PCD_Init(&hpcd_USB_OTG_FS) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USB_OTG_FS_Init 2 */
+
+  /* USER CODE END USB_OTG_FS_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOG_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, LD1_Pin|LD3_Pin|LD2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(USB_PowerSwitchOn_GPIO_Port, USB_PowerSwitchOn_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : USER_Btn_Pin */
+  GPIO_InitStruct.Pin = USER_Btn_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(USER_Btn_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : LD1_Pin LD3_Pin LD2_Pin */
+  GPIO_InitStruct.Pin = LD1_Pin|LD3_Pin|LD2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : USB_PowerSwitchOn_Pin */
+  GPIO_InitStruct.Pin = USB_PowerSwitchOn_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(USB_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : USB_OverCurrent_Pin */
+  GPIO_InitStruct.Pin = USB_OverCurrent_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(USB_OverCurrent_GPIO_Port, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
