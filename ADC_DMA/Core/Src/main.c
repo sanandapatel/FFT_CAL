@@ -2,98 +2,114 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  * @brief          : Deterministic FFT Spectrum Analyzer - Complete Buildable
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "string.h"
-
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-
-/* USER CODE END Includes */
+#include <stdio.h>
+#include <math.h>
+#include "arm_math.h"
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef struct {
+    uint8_t data[1056]; /* 4 header + 1024 payload, padded to 32-byte align */
+    volatile uint8_t ready;
+} TxPacket_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define ADC_BUFFER_SIZE        1024
-#define ADC_HALF_BUFFER_SIZE   (ADC_BUFFER_SIZE / 2)
+#define ADC_BUFFER_SIZE      1024U
+#define ADC_HALF_BUFFER      (ADC_BUFFER_SIZE / 2U)
+#define FFT_SIZE             512U
+#define FFT_MAG_SIZE         (FFT_SIZE / 2U)
 
-#define TX_QUEUE_DEPTH          8
-#define TX_QUEUE_INDEX_MASK    (TX_QUEUE_DEPTH - 1)
+/* Actual sample rate: 96MHz / (2247+1) = 42704.8 Hz */
+#define ACTUAL_SAMPLE_RATE   42704.8f
+#define FREQ_PER_BIN         (ACTUAL_SAMPLE_RATE / (float)FFT_SIZE)
+
+/* Post-FFT normalization: Hann gain(2) × single-sided(2) / N */
+#define FFT_NORM_FACTOR      (4.0f / (float)FFT_SIZE)
+
+/* Ring buffer depth */
+#define TX_QUEUE_DEPTH       4U
+
+/* UART packet sizes */
+#define PKT_RAW_SIZE         (4U + FFT_MAG_SIZE * sizeof(float32_t)) /* 1028 */
+#define PKT_ALIGNED_SIZE     ((PKT_RAW_SIZE + 31U) & ~31U)           /* 1056 */
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 /* USER CODE END PD */
 
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
-
 /* Private variables ---------------------------------------------------------*/
-#if defined ( __ICCARM__ ) /*!< IAR Compiler */
+#if defined(__ICCARM__)
 #pragma location=0x2007c000
-ETH_DMADescTypeDef  DMARxDscrTab[ETH_RX_DESC_CNT]; /* Ethernet Rx DMA Descriptors */
+ETH_DMADescTypeDef DMARxDscrTab[ETH_RX_DESC_CNT];
 #pragma location=0x2007c0a0
-ETH_DMADescTypeDef  DMATxDscrTab[ETH_TX_DESC_CNT]; /* Ethernet Tx DMA Descriptors */
-
-#elif defined ( __CC_ARM )  /* MDK ARM Compiler */
-
-__attribute__((at(0x2007c000))) ETH_DMADescTypeDef  DMARxDscrTab[ETH_RX_DESC_CNT]; /* Ethernet Rx DMA Descriptors */
-__attribute__((at(0x2007c0a0))) ETH_DMADescTypeDef  DMATxDscrTab[ETH_TX_DESC_CNT]; /* Ethernet Tx DMA Descriptors */
-
-#elif defined ( __GNUC__ ) /* GNU Compiler */
-
-ETH_DMADescTypeDef DMARxDscrTab[ETH_RX_DESC_CNT] __attribute__((section(".RxDecripSection"))); /* Ethernet Rx DMA Descriptors */
-ETH_DMADescTypeDef DMATxDscrTab[ETH_TX_DESC_CNT] __attribute__((section(".TxDecripSection")));   /* Ethernet Tx DMA Descriptors */
+ETH_DMADescTypeDef DMATxDscrTab[ETH_TX_DESC_CNT];
+#elif defined(__CC_ARM)
+__attribute__((at(0x2007c000))) ETH_DMADescTypeDef DMARxDscrTab[ETH_RX_DESC_CNT];
+__attribute__((at(0x2007c0a0))) ETH_DMADescTypeDef DMATxDscrTab[ETH_TX_DESC_CNT];
+#elif defined(__GNUC__)
+ETH_DMADescTypeDef DMARxDscrTab[ETH_RX_DESC_CNT] __attribute__((section(".RxDecripSection")));
+ETH_DMADescTypeDef DMATxDscrTab[ETH_TX_DESC_CNT] __attribute__((section(".TxDecripSection")));
 #endif
 
 ETH_TxPacketConfig TxConfig;
-
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
-
 ETH_HandleTypeDef heth;
-
 TIM_HandleTypeDef htim2;
-
 UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 DMA_HandleTypeDef hdma_usart3_tx;
-
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
-/* Aligned arrays mapped out safely for the data engine.
-   32-byte alignment is strictly required for Cortex-M7 cache maintenance operations. */
-uint16_t adc_buffer[ADC_BUFFER_SIZE] __attribute__((aligned(32)));
-static uint16_t tx_queue[TX_QUEUE_DEPTH][ADC_HALF_BUFFER_SIZE] __attribute__((aligned(32)));
+/* ADC DMA buffer - MUST be in SRAM1 for DMA access */
+uint16_t adc_buffer[ADC_BUFFER_SIZE] __attribute__((aligned(32), section(".dma_buffer")));
 
-static volatile uint16_t queue_head  = 0;
-static volatile uint16_t queue_tail  = 0;
-static volatile uint16_t queue_count = 0;
+/* Double-buffered staging area - copy happens IN ISR before DMA overwrites */
+static uint16_t adc_staging_A[FFT_SIZE] __attribute__((aligned(32)));
+static uint16_t adc_staging_B[FFT_SIZE] __attribute__((aligned(32)));
 
-static volatile uint32_t queue_overflow_count = 0;
-static volatile uint8_t uart_tx_busy = 0;
+/* Flags set by ISR, consumed by main loop */
+static volatile uint8_t buf_A_ready = 0;
+static volatile uint8_t buf_B_ready = 0;
+
+/* FFT working buffers - all 32-byte aligned */
+static float32_t fft_in[FFT_SIZE]      __attribute__((aligned(32)));
+static float32_t fft_out[FFT_SIZE]     __attribute__((aligned(32)));
+static float32_t fft_mag[FFT_MAG_SIZE] __attribute__((aligned(32)));
+static float32_t hann_lut[FFT_SIZE]    __attribute__((aligned(32)));
+static arm_rfft_fast_instance_f32 fft_inst;
+
+/* UART TX ring buffer with 32-byte aligned packets */
+static TxPacket_t tx_queue[TX_QUEUE_DEPTH];
+static volatile uint8_t tx_head = 0;
+static volatile uint8_t tx_tail = 0;
+static volatile uint8_t uart_busy = 0;
+
+/* Diagnostic counters */
+static volatile uint32_t diag_half_cnt = 0;
+static volatile uint32_t diag_full_cnt = 0;
+static volatile uint32_t diag_overrun  = 0;
+static volatile uint32_t diag_uart_err = 0;
+
+/* Heartbeat state */
+static uint32_t hb_tick = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-static void MPU_Config(void); // <--- ADDED: Required for Cache coherency
+static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_ETH_Init(void);
@@ -103,93 +119,167 @@ static void MX_TIM2_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
-static void UART_Queue_Service(void);
-static void ADC_Queue_Enqueue(const uint16_t *src);
+static void FFT_Init(void);
+static void FFT_Process(const uint16_t *src);
+static void Build_Binary_Packet(void);
+static void UART_Service(void);
+static void Heartbeat_Task(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-static void ADC_Queue_Enqueue(const uint16_t *src)
-{
-  if (queue_count >= TX_QUEUE_DEPTH)
-  {
-    queue_overflow_count++;
-    return;
-  }
-
-  memcpy(&tx_queue[queue_tail][0], src, ADC_HALF_BUFFER_SIZE * sizeof(uint16_t));
-  queue_tail = (queue_tail + 1) & TX_QUEUE_INDEX_MASK;
-  queue_count++;
-}
-
+/* ═══════════════════════ ADC DMA Callbacks ══════════════════════ */
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc)
 {
-  if (hadc->Instance == ADC1)
-  {
-    /* CRITICAL: Invalidate D-Cache before CPU reads data written by ADC DMA. */
-    SCB_InvalidateDCache_by_Addr((uint32_t *)&adc_buffer[0], ADC_HALF_BUFFER_SIZE * sizeof(uint16_t));
-
-    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_0); // Toggle LD1
-    ADC_Queue_Enqueue(&adc_buffer[0]);
-  }
+    if (hadc->Instance == ADC1) {
+        diag_half_cnt++;
+        SCB_InvalidateDCache_by_Addr((uint32_t *)&adc_buffer[0],
+                                     ADC_HALF_BUFFER * sizeof(uint16_t));
+        memcpy(adc_staging_A, &adc_buffer[0], FFT_SIZE * sizeof(uint16_t));
+        buf_A_ready = 1;
+    }
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-  if (hadc->Instance == ADC1)
-  {
-    /* CRITICAL: Invalidate D-Cache for the second half of the buffer */
-    SCB_InvalidateDCache_by_Addr((uint32_t *)&adc_buffer[ADC_HALF_BUFFER_SIZE], ADC_HALF_BUFFER_SIZE * sizeof(uint16_t));
-
-    ADC_Queue_Enqueue(&adc_buffer[ADC_HALF_BUFFER_SIZE]);
-  }
+    if (hadc->Instance == ADC1) {
+        diag_full_cnt++;
+        SCB_InvalidateDCache_by_Addr((uint32_t *)&adc_buffer[ADC_HALF_BUFFER],
+                                     ADC_HALF_BUFFER * sizeof(uint16_t));
+        memcpy(adc_staging_B, &adc_buffer[ADC_HALF_BUFFER], FFT_SIZE * sizeof(uint16_t));
+        buf_B_ready = 1;
+    }
 }
 
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
+{
+    (void)hadc;
+}
+
+/* ═══════════════════════ UART DMA Callbacks ═══════════════════════ */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
-  if (huart->Instance == USART3)
-  {
-    queue_head = (queue_head + 1) & TX_QUEUE_INDEX_MASK;
-    queue_count--;
-    uart_tx_busy = 0;
-  }
+    if (huart->Instance == USART3) {
+        uart_busy = 0;
+    }
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-  if (huart->Instance == USART3)
-  {
-    if (uart_tx_busy)
-    {
-      queue_head = (queue_head + 1) & TX_QUEUE_INDEX_MASK;
-      if (queue_count > 0)
-      {
-        queue_count--;
-      }
-      uart_tx_busy = 0;
+    if (huart->Instance == USART3) {
+        diag_uart_err++;
+        uart_busy = 0;
+        __HAL_UART_CLEAR_PEFLAG(huart);
+        if (tx_tail != tx_head) {
+            tx_tail = (tx_tail + 1) % TX_QUEUE_DEPTH;
+        }
     }
-    __HAL_UART_CLEAR_PEFLAG(huart);
-  }
 }
 
-/* CLEAN, NON-BLOCKING QUEUE SERVICE */
-static void UART_Queue_Service(void)
+/* ══════════════════════ FFT Engine ═════════════════════════════ */
+static void FFT_Init(void)
 {
-  if ((uart_tx_busy == 0) && (queue_count > 0))
-  {
-    uart_tx_busy = 1;
-
-    /* CRITICAL: Clean D-Cache before UART DMA reads data written by the CPU. */
-    SCB_CleanDCache_by_Addr((uint32_t *)&tx_queue[queue_head][0], ADC_HALF_BUFFER_SIZE * sizeof(uint16_t));
-
-    if (HAL_UART_Transmit_DMA(&huart3,
-                               (uint8_t *)&tx_queue[queue_head][0],
-                               ADC_HALF_BUFFER_SIZE * sizeof(uint16_t)) != HAL_OK)
-    {
-      uart_tx_busy = 0;
+    /* PURE Hann window - no gain baked in */
+    for (uint32_t i = 0; i < FFT_SIZE; i++) {
+        hann_lut[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * (float)i / (float)(FFT_SIZE - 1U)));
     }
-  }
+
+    arm_status s = arm_rfft_fast_init_f32(&fft_inst, FFT_SIZE);
+    if (s != ARM_MATH_SUCCESS) {
+        Error_Handler();
+    }
+}
+
+static void FFT_Process(const uint16_t *src)
+{
+    /* Pass 1: True DC mean */
+    float32_t sum = 0.0f;
+    for (uint32_t i = 0; i < FFT_SIZE; i++) {
+        sum += (float32_t)src[i];
+    }
+    float32_t mean = sum / (float32_t)FFT_SIZE;
+
+    /* Pass 2: Convert + subtract mean + PURE Hann window */
+    for (uint32_t i = 0; i < FFT_SIZE; i++) {
+        fft_in[i] = ((float32_t)src[i] - mean) * hann_lut[i];
+    }
+
+    /* Real FFT */
+    arm_rfft_fast_f32(&fft_inst, fft_in, fft_out, 0);
+
+    /* Correct packed output per CMSIS docs */
+    fft_mag[0] = fabsf(fft_out[0]) * FFT_NORM_FACTOR;
+    arm_cmplx_mag_f32(&fft_out[2], &fft_mag[1], FFT_MAG_SIZE - 1U);
+
+    /* Single scalar normalization for all AC bins */
+    for (uint32_t i = 1; i < FFT_MAG_SIZE; i++) {
+        fft_mag[i] *= FFT_NORM_FACTOR;
+    }
+
+    /* Sanity check */
+    for (uint32_t i = 0; i < FFT_MAG_SIZE; i++) {
+        if (!isfinite(fft_mag[i])) fft_mag[i] = 0.0f;
+    }
+}
+
+/* ═════════════════════ Binary Packet Builder ═════════════════ */
+static void Build_Binary_Packet(void)
+{
+    uint8_t idx = tx_head;
+    uint8_t *pkt = tx_queue[idx].data;
+
+    pkt[0] = 0xAA;
+    pkt[1] = 0x55;
+    pkt[2] = (uint8_t)(FFT_MAG_SIZE & 0xFF);
+    pkt[3] = (uint8_t)((FFT_MAG_SIZE >> 8) & 0xFF);
+
+    memcpy(&pkt[4], fft_mag, FFT_MAG_SIZE * sizeof(float32_t));
+
+    tx_queue[idx].ready = 1;
+}
+
+/* ═══════════════════════ UART Service (Main Loop) ═══════════════ */
+static void UART_Service(void)
+{
+    if (uart_busy != 0) return;
+
+    uint8_t idx = tx_tail;
+    if (tx_queue[idx].ready == 0) return;
+
+    uart_busy = 1;
+    SCB_CleanDCache_by_Addr((uint32_t *)tx_queue[idx].data, PKT_ALIGNED_SIZE);
+
+    if (HAL_UART_Transmit_DMA(&huart3, tx_queue[idx].data, PKT_RAW_SIZE) != HAL_OK) {
+        uart_busy = 0;
+        tx_queue[idx].ready = 0;
+        tx_tail = (tx_tail + 1) % TX_QUEUE_DEPTH;
+    } else {
+        tx_queue[idx].ready = 0;
+        tx_tail = (tx_tail + 1) % TX_QUEUE_DEPTH;
+    }
+}
+
+/* ═══════════════════════ Heartbeat Diagnostics ═════════════════ */
+static void Heartbeat_Task(void)
+{
+    if ((HAL_GetTick() - hb_tick) >= 500U) {
+        hb_tick = HAL_GetTick();
+        HAL_GPIO_TogglePin(LD1_GPIO_Port, LD1_Pin);
+
+        static uint32_t last_check = 0;
+        if ((HAL_GetTick() - last_check) >= 1000U) {
+            last_check = HAL_GetTick();
+            if (diag_half_cnt == 0 && diag_full_cnt == 0) {
+                for (int i = 0; i < 5; i++) {
+                    HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+                    HAL_Delay(50);
+                }
+            }
+            diag_half_cnt = 0;
+            diag_full_cnt = 0;
+        }
+    }
 }
 /* USER CODE END 0 */
 
@@ -199,22 +289,12 @@ static void UART_Queue_Service(void)
   */
 int main(void)
 {
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
-  /* MCU Configuration--------------------------------------------------------*/
   HAL_Init();
   SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-  /* CRITICAL: Configure MPU and enable Caches for DMA coherency on Cortex-M7 */
   MPU_Config();
   SCB_EnableICache();
   SCB_EnableDCache();
-  /* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ETH_Init();
@@ -224,32 +304,67 @@ int main(void)
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
 
-  /* USER CODE BEGIN 2 */
-  HAL_Delay(100);
-  const char *test_msg = "USART3 ADC Stream Started!\r\n";
-  HAL_UART_Transmit(&huart3, (uint8_t *)test_msg, strlen(test_msg), 1000);
+  memset(adc_buffer, 0, sizeof(adc_buffer));
+  memset(tx_queue, 0, sizeof(tx_queue));
 
-  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, ADC_BUFFER_SIZE) != HAL_OK)
+  FFT_Init();
+
+  /* Startup UART test */
   {
-    Error_Handler();
+      const char *msg = "USART3 VCP Test OK\r\n";
+      HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), 1000);
+      HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_SET);
+      HAL_Delay(200);
+      HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_RESET);
   }
 
-  if (HAL_TIM_Base_Start(&htim2) != HAL_OK)
-  {
-    Error_Handler();
+  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, ADC_BUFFER_SIZE) != HAL_OK) {
+      Error_Handler();
   }
-  /* USER CODE END 2 */
+  if (HAL_TIM_Base_Start(&htim2) != HAL_OK) {
+      Error_Handler();
+  }
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
   {
-    UART_Queue_Service();
-    /* USER CODE END WHILE */
+      if (buf_A_ready) {
+          buf_A_ready = 0;
+          FFT_Process(adc_staging_A);
+          uint8_t next_head = (tx_head + 1) % TX_QUEUE_DEPTH;
+          if (next_head == tx_tail) {
+              diag_overrun++;
+              tx_tail = (tx_tail + 1) % TX_QUEUE_DEPTH;
+          }
+          Build_Binary_Packet();
+          tx_head = next_head;
+      }
 
-    /* USER CODE BEGIN 3 */
+      if (buf_B_ready) {
+          buf_B_ready = 0;
+          FFT_Process(adc_staging_B);
+          uint8_t next_head = (tx_head + 1) % TX_QUEUE_DEPTH;
+          if (next_head == tx_tail) {
+              diag_overrun++;
+              tx_tail = (tx_tail + 1) % TX_QUEUE_DEPTH;
+          }
+          Build_Binary_Packet();
+          tx_head = next_head;
+      }
+
+      UART_Service();
+      /* In main.c while(1) loop, after UART_Service() */
+//      static uint32_t sync_counter = 0;
+//      if (++sync_counter >= 100) {
+//          sync_counter = 0;
+//          if (!uart_busy) {
+//              static const uint8_t RESYNC_MARKER[4] = {0xAA, 0x55, 0xFF, 0xFF};
+//              uart_busy = 1;
+//              SCB_CleanDCache_by_Addr((uint32_t *)RESYNC_MARKER, 32);
+//              HAL_UART_Transmit_DMA(&huart3, (uint8_t *)RESYNC_MARKER, 4);
+//          }
+//      }
+      Heartbeat_Task();
   }
-  /* USER CODE END 3 */
 }
 
 /**
@@ -274,15 +389,8 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 4;
   RCC_OscInitStruct.PLL.PLLR = 2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  if (HAL_PWREx_EnableOverDrive() != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+  if (HAL_PWREx_EnableOverDrive() != HAL_OK) Error_Handler();
 
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
@@ -290,23 +398,12 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK) Error_Handler();
 }
 
-/**
-  * @brief ADC1 Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_ADC1_Init(void)
 {
   ADC_ChannelConfTypeDef sConfig = {0};
-  ADC_InjectionConfTypeDef sConfigInjected = {0};
-
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
@@ -319,105 +416,48 @@ static void MX_ADC1_Init(void)
   hadc1.Init.NbrOfConversion = 1;
   hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
-  if (HAL_ADC_Init(&hadc1) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
 
   sConfig.Channel = ADC_CHANNEL_0;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  sConfigInjected.InjectedChannel = ADC_CHANNEL_0;
-  sConfigInjected.InjectedRank = ADC_INJECTED_RANK_1;
-  sConfigInjected.InjectedNbrOfConversion = 1;
-  sConfigInjected.InjectedSamplingTime = ADC_SAMPLETIME_3CYCLES;
-  sConfigInjected.ExternalTrigInjecConvEdge = ADC_EXTERNALTRIGINJECCONVEDGE_NONE;
-  sConfigInjected.ExternalTrigInjecConv = ADC_INJECTED_SOFTWARE_START;
-  sConfigInjected.AutoInjectedConv = DISABLE;
-  sConfigInjected.InjectedDiscontinuousConvMode = DISABLE;
-  sConfigInjected.InjectedOffset = 0;
-  if (HAL_ADCEx_InjectedConfigChannel(&hadc1, &sConfigInjected) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  sConfig.SamplingTime = ADC_SAMPLETIME_144CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) Error_Handler();
 }
 
-/**
-  * @brief ETH Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_ETH_Init(void)
 {
-   static uint8_t MACAddr[6];
-
+   static uint8_t MACAddr[6] = {0x00, 0x80, 0xE1, 0x00, 0x00, 0x00};
   heth.Instance = ETH;
-  MACAddr[0] = 0x00;
-  MACAddr[1] = 0x80;
-  MACAddr[2] = 0xE1;
-  MACAddr[3] = 0x00;
-  MACAddr[4] = 0x00;
-  MACAddr[5] = 0x00;
   heth.Init.MACAddr = &MACAddr[0];
   heth.Init.MediaInterface = HAL_ETH_RMII_MODE;
   heth.Init.TxDesc = DMATxDscrTab;
   heth.Init.RxDesc = DMARxDscrTab;
   heth.Init.RxBuffLen = 1524;
-
-  if (HAL_ETH_Init(&heth) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  memset(&TxConfig, 0 , sizeof(ETH_TxPacketConfig));
+  if (HAL_ETH_Init(&heth) != HAL_OK) Error_Handler();
+  memset(&TxConfig, 0, sizeof(ETH_TxPacketConfig));
   TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CSUM | ETH_TX_PACKETS_FEATURES_CRCPAD;
   TxConfig.ChecksumCtrl = ETH_CHECKSUM_IPHDR_PAYLOAD_INSERT_PHDR_CALC;
   TxConfig.CRCPadCtrl = ETH_CRC_PAD_INSERT;
 }
 
-/**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_TIM2_Init(void)
 {
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
-
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 2249;
+  htim2.Init.Period = 2247;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK) Error_Handler();
   sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK) Error_Handler();
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) Error_Handler();
 }
 
-/**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_USART2_UART_Init(void)
 {
   huart2.Instance = USART2;
@@ -430,17 +470,9 @@ static void MX_USART2_UART_Init(void)
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
   huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_UART_Init(&huart2) != HAL_OK) Error_Handler();
 }
 
-/**
-  * @brief USART3 Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_USART3_UART_Init(void)
 {
   huart3.Instance = USART3;
@@ -450,20 +482,12 @@ static void MX_USART3_UART_Init(void)
   huart3.Init.Parity = UART_PARITY_NONE;
   huart3.Init.Mode = UART_MODE_TX_RX;
   huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart3.Init.OverSampling = UART_OVERSAMPLING_8;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
   huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart3) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_UART_Init(&huart3) != HAL_OK) Error_Handler();
 }
 
-/**
-  * @brief USB_OTG_FS Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_USB_OTG_FS_PCD_Init(void)
 {
   hpcd_USB_OTG_FS.Instance = USB_OTG_FS;
@@ -476,39 +500,22 @@ static void MX_USB_OTG_FS_PCD_Init(void)
   hpcd_USB_OTG_FS.Init.lpm_enable = DISABLE;
   hpcd_USB_OTG_FS.Init.vbus_sensing_enable = ENABLE;
   hpcd_USB_OTG_FS.Init.use_dedicated_ep1 = DISABLE;
-  if (HAL_PCD_Init(&hpcd_USB_OTG_FS) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_PCD_Init(&hpcd_USB_OTG_FS) != HAL_OK) Error_Handler();
 }
 
-/**
-  * Enable DMA controller clock
-  */
 static void MX_DMA_Init(void)
 {
-  /* DMA controller clock enable */
   __HAL_RCC_DMA2_CLK_ENABLE();
   __HAL_RCC_DMA1_CLK_ENABLE();
-
-  /* DMA interrupt init */
-  /* DMA1_Stream3_IRQn interrupt configuration (USART3 TX) */
   HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
-  /* DMA2_Stream0_IRQn interrupt configuration (ADC1) */
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 }
 
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -543,16 +550,10 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
-/**
-  * @brief Configures the Memory Protection Unit for Data-Cache safety.
-  */
 static void MPU_Config(void)
 {
   MPU_Region_InitTypeDef MPU_InitStruct = {0};
-
   HAL_MPU_Disable();
-
   MPU_InitStruct.Enable = MPU_REGION_ENABLE;
   MPU_InitStruct.Number = MPU_REGION_NUMBER0;
   MPU_InitStruct.BaseAddress = 0x20020000;
@@ -564,38 +565,17 @@ static void MPU_Config(void)
   MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
   MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
   MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
-
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
   HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 }
 
-/* USER CODE END 4 */
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
   __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
+  while (1) {}
 }
 
 #ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
-  /* USER CODE BEGIN 6 */
-  /* USER CODE END 6 */
-}
-#endif /* USE_FULL_ASSERT */
+void assert_failed(uint8_t *file, uint32_t line) {}
+#endif
+/* USER CODE END 4 */
